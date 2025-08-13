@@ -16,7 +16,7 @@
 //!     .eq("status", Some("active"))
 //!     .gt("age", Some(18))
 //!     .like("name", Some("John".to_string()), LikePosition::Start)
-//!     .build();
+//!     .into_parts();
 //! ```
 //!
 //! ## Complex Conditions with Groups
@@ -31,7 +31,7 @@
 //!              .eq("brand", Some("Apple"));
 //!     })
 //!     .active_only(true)
-//!     .build();
+//!     .into_parts();
 //! ```
 //!
 //! ## Pagination Support
@@ -45,7 +45,7 @@
 //!     .eq("published", Some(true))
 //!     .like("title", Some("rust".to_string()), LikePosition::Contains)
 //!     .paginate(&pagination)
-//!     .build();
+//!     .into_parts();
 //! // Generates: SELECT * FROM articles WHERE published =$1 AND title LIKE$2
 //! //           ORDER BY created_at DESC LIMIT 10 OFFSET 10
 //! ```
@@ -61,10 +61,71 @@
 //! let query = WhereBuilder::new("SELECT * FROM users")
 //!     .eq("status", status_filter)
 //!     .paginate(&pagination)
-//!     .build();
+//!     .into_parts();
 //! ```
 
-use sqlx::{Postgres, QueryBuilder, postgres::PgHasArrayType};
+use sqlx::{
+    Arguments, Postgres,
+    postgres::{PgArguments, PgHasArrayType},
+};
+use std::fmt;
+
+/// A specialized PostgreSQL query builder that supports cloning.
+///
+/// This is a replacement for `sqlx::QueryBuilder<Postgres>` with the following advantages:
+/// - Supports `Clone` trait for flexibility in usage
+/// - PostgreSQL-specific (no generic type parameters)
+/// - Simplified lifetime management
+/// - Direct integration with `PgArguments`
+#[derive(Clone, Debug)]
+pub struct PgQueryBuilder {
+    sql: String,
+    arguments: PgArguments,
+    next_param_index: u16,
+}
+
+impl<'args> PgQueryBuilder {
+    /// Creates a new PostgreSQL query builder with the given initial SQL.
+    pub fn new(sql: impl Into<String>) -> Self {
+        Self {
+            sql: sql.into(),
+            arguments: PgArguments::default(),
+            next_param_index: 1,
+        }
+    }
+
+    /// Appends a SQL fragment to the query.
+    pub fn push(&mut self, sql: impl fmt::Display) -> &mut Self {
+        self.sql.push_str(&sql.to_string());
+        self
+    }
+
+    /// Binds a parameter and appends its placeholder to the query.
+    pub fn push_bind<T>(&mut self, value: T) -> &mut Self
+    where
+        T: 'args + sqlx::Type<Postgres> + sqlx::Encode<'args, Postgres> + Send,
+    {
+        // Add the parameter placeholder to the SQL
+        self.sql.push('$');
+        self.sql.push_str(&self.next_param_index.to_string());
+
+        // Add the value to arguments
+        self.arguments.add(value).expect("Failed to bind parameter");
+        self.next_param_index += 1;
+
+        self
+    }
+
+    /// Returns the current SQL string.
+    pub fn sql(&self) -> &str {
+        &self.sql
+    }
+
+    /// Destruct into usable parts.
+    pub fn into_parts(self) -> (String, PgArguments) {
+        (self.sql, self.arguments)
+    }
+}
 
 /// Sort direction for ORDER BY clauses.
 ///
@@ -102,7 +163,7 @@ impl std::fmt::Display for SortDirection {
 /// let query = WhereBuilder::new("SELECT * FROM users")
 ///     .eq("status", Some("active"))
 ///     .paginate(&pagination)
-///     .build();
+///     .into_parts();
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paginate {
@@ -236,13 +297,17 @@ impl Default for Paginate {
 /// The `WhereBuilder` provides a chainable API for building complex WHERE conditions
 /// while automatically handling the `WHERE` keyword, `AND` conjunctions, and parameter binding.
 /// All methods are conditional - they only add clauses when provided with `Some` values.
-pub struct WhereBuilder<'a> {
-    builder: QueryBuilder<'a, Postgres>,
+///
+/// This version uses our specialized `PgQueryBuilder` which supports cloning and removes
+/// lifetime constraints for greater flexibility.
+#[derive(Clone, Debug)]
+pub struct WhereBuilder {
+    builder: PgQueryBuilder,
     has_where: bool,
     condition_count: usize,
 }
 
-impl<'a> WhereBuilder<'a> {
+impl WhereBuilder {
     /// Creates a new `WhereBuilder` with the given base SQL query.
     ///
     /// The base query should be a complete SQL statement up to but not including
@@ -262,7 +327,7 @@ impl<'a> WhereBuilder<'a> {
     /// ```
     pub fn new(base_query: &str) -> Self {
         Self {
-            builder: QueryBuilder::new(base_query),
+            builder: PgQueryBuilder::new(base_query),
             has_where: false,
             condition_count: 0,
         }
@@ -299,11 +364,11 @@ impl<'a> WhereBuilder<'a> {
     /// let query = WhereBuilder::new("SELECT * FROM users")
     ///     .and_if("age", ">", Some(18))
     ///     .and_if("status", "=", None::<String>) // This won't add anything
-    ///     .build();
+    ///     .into_parts();
     /// ```
     pub fn and_if<T>(mut self, column: &str, op: &str, value: Option<T>) -> Self
     where
-        T: 'a + Send + sqlx::Type<Postgres> + sqlx::Encode<'a, Postgres>,
+        T: Send + sqlx::Type<Postgres> + for<'q> sqlx::Encode<'q, Postgres>,
     {
         if let Some(val) = value {
             self.add_condition(&format!("{column} {op}"));
@@ -321,12 +386,12 @@ impl<'a> WhereBuilder<'a> {
     ///
     /// let query = WhereBuilder::new("SELECT * FROM users")
     ///     .eq("status", Some("active"))
-    ///     .build();
+    ///     .into_parts();
     /// // Generates: SELECT * FROM users WHERE status = $1
     /// ```
     pub fn eq<T>(self, column: &str, value: Option<T>) -> Self
     where
-        T: 'a + Send + sqlx::Type<Postgres> + sqlx::Encode<'a, Postgres>,
+        T: Send + sqlx::Type<Postgres> + for<'q> sqlx::Encode<'q, Postgres>,
     {
         self.and_if(column, "=", value)
     }
@@ -334,7 +399,7 @@ impl<'a> WhereBuilder<'a> {
     /// Adds a not-equal condition (`column != value`) if value is `Some`.
     pub fn ne<T>(self, column: &str, value: Option<T>) -> Self
     where
-        T: 'a + Send + sqlx::Type<Postgres> + sqlx::Encode<'a, Postgres>,
+        T: Send + sqlx::Type<Postgres> + for<'q> sqlx::Encode<'q, Postgres>,
     {
         self.and_if(column, "!=", value)
     }
@@ -342,7 +407,7 @@ impl<'a> WhereBuilder<'a> {
     /// Adds a greater-than condition (`column > value`) if value is `Some`.
     pub fn gt<T>(self, column: &str, value: Option<T>) -> Self
     where
-        T: 'a + Send + sqlx::Type<Postgres> + sqlx::Encode<'a, Postgres>,
+        T: Send + sqlx::Type<Postgres> + for<'q> sqlx::Encode<'q, Postgres>,
     {
         self.and_if(column, ">", value)
     }
@@ -350,7 +415,7 @@ impl<'a> WhereBuilder<'a> {
     /// Adds a greater-than-or-equal condition (`column >= value`) if value is `Some`.
     pub fn gte<T>(self, column: &str, value: Option<T>) -> Self
     where
-        T: 'a + Send + sqlx::Type<Postgres> + sqlx::Encode<'a, Postgres>,
+        T: Send + sqlx::Type<Postgres> + for<'q> sqlx::Encode<'q, Postgres>,
     {
         self.and_if(column, ">=", value)
     }
@@ -358,7 +423,7 @@ impl<'a> WhereBuilder<'a> {
     /// Adds a less-than condition (`column < value`) if value is `Some`.
     pub fn lt<T>(self, column: &str, value: Option<T>) -> Self
     where
-        T: 'a + Send + sqlx::Type<Postgres> + sqlx::Encode<'a, Postgres>,
+        T: Send + sqlx::Type<Postgres> + for<'q> sqlx::Encode<'q, Postgres>,
     {
         self.and_if(column, "<", value)
     }
@@ -366,7 +431,7 @@ impl<'a> WhereBuilder<'a> {
     /// Adds a less-than-or-equal condition (`column <= value`) if value is `Some`.
     pub fn lte<T>(self, column: &str, value: Option<T>) -> Self
     where
-        T: 'a + Send + sqlx::Type<Postgres> + sqlx::Encode<'a, Postgres>,
+        T: Send + sqlx::Type<Postgres> + for<'q> sqlx::Encode<'q, Postgres>,
     {
         self.and_if(column, "<=", value)
     }
@@ -383,12 +448,12 @@ impl<'a> WhereBuilder<'a> {
     ///
     /// let query = WhereBuilder::new("SELECT * FROM products")
     ///     .between("price", Some(10.0), Some(100.0))
-    ///     .build();
+    ///     .into_parts();
     /// // Generates: SELECT * FROM products WHERE price >= $1 AND price <= $2
     /// ```
     pub fn between<T>(mut self, column: &str, min: Option<T>, max: Option<T>) -> Self
     where
-        T: 'a + Send + sqlx::Type<Postgres> + sqlx::Encode<'a, Postgres>,
+        T: Send + sqlx::Type<Postgres> + for<'q> sqlx::Encode<'q, Postgres>,
     {
         if let Some(min_val) = min {
             self.add_condition(&format!("{column} >="));
@@ -416,7 +481,7 @@ impl<'a> WhereBuilder<'a> {
     ///
     /// let query = WhereBuilder::new("SELECT * FROM users")
     ///     .like("name", Some("John".to_string()), LikePosition::Start)
-    ///     .build();
+    ///     .into_parts();
     /// // Generates: SELECT * FROM users WHERE name LIKE $1 (with value "John%")
     /// ```
     pub fn like(self, column: &str, value: Option<String>, position: LikePosition) -> Self {
@@ -435,12 +500,12 @@ impl<'a> WhereBuilder<'a> {
     ///
     /// let query = WhereBuilder::new("SELECT * FROM users")
     ///     .in_array("status", Some(vec!["active", "pending"]))
-    ///     .build();
+    ///     .into_parts();
     /// // Generates: SELECT * FROM users WHERE status = ANY($1)
     /// ```
     pub fn in_array<T>(mut self, column: &str, values: Option<Vec<T>>) -> Self
     where
-        T: 'a + Send + sqlx::Type<Postgres> + sqlx::Encode<'a, Postgres> + PgHasArrayType,
+        T: Send + sqlx::Type<Postgres> + for<'q> sqlx::Encode<'q, Postgres> + PgHasArrayType,
     {
         if let Some(vals) = values {
             if !vals.is_empty() {
@@ -469,12 +534,12 @@ impl<'a> WhereBuilder<'a> {
     ///
     /// let query = WhereBuilder::new("SELECT * FROM properties")
     ///     .array_overlap("asset_class", Some(vec!["hotel", "restaurant"]))
-    ///     .build();
+    ///     .into_parts();
     /// // Generates: SELECT * FROM properties WHERE asset_class && $1
     /// ```
     pub fn array_overlap<T>(mut self, column: &str, values: Option<Vec<T>>) -> Self
     where
-        T: 'a + Send + sqlx::Type<Postgres> + sqlx::Encode<'a, Postgres> + PgHasArrayType,
+        T: Send + sqlx::Type<Postgres> + for<'q> sqlx::Encode<'q, Postgres> + PgHasArrayType,
     {
         if let Some(vals) = values {
             if !vals.is_empty() {
@@ -502,12 +567,12 @@ impl<'a> WhereBuilder<'a> {
     ///
     /// let query = WhereBuilder::new("SELECT * FROM properties")
     ///     .array_contains_any("asset_class", Some(vec!["hotel", "restaurant"]))
-    ///     .build();
+    ///     .into_parts();
     /// // Generates: SELECT * FROM properties WHERE asset_class @> $1
     /// ```
     pub fn array_contains_any<T>(mut self, column: &str, values: Option<Vec<T>>) -> Self
     where
-        T: 'a + Send + sqlx::Type<Postgres> + sqlx::Encode<'a, Postgres> + PgHasArrayType,
+        T: Send + sqlx::Type<Postgres> + for<'q> sqlx::Encode<'q, Postgres> + PgHasArrayType,
     {
         if let Some(vals) = values {
             if !vals.is_empty() {
@@ -535,12 +600,12 @@ impl<'a> WhereBuilder<'a> {
     ///
     /// let query = WhereBuilder::new("SELECT * FROM properties")
     ///     .array_contained_by("asset_class", Some(vec!["hotel", "restaurant", "retail"]))
-    ///     .build();
+    ///     .into_parts();
     /// // Generates: SELECT * FROM properties WHERE asset_class <@ $1
     /// ```
     pub fn array_contained_by<T>(mut self, column: &str, values: Option<Vec<T>>) -> Self
     where
-        T: 'a + Send + sqlx::Type<Postgres> + sqlx::Encode<'a, Postgres> + PgHasArrayType,
+        T: Send + sqlx::Type<Postgres> + for<'q> sqlx::Encode<'q, Postgres> + PgHasArrayType,
     {
         if let Some(vals) = values {
             if !vals.is_empty() {
@@ -567,7 +632,7 @@ impl<'a> WhereBuilder<'a> {
     ///
     /// let query = WhereBuilder::new("SELECT * FROM users")
     ///     .is_null("deleted_at", true)
-    ///     .build();
+    ///     .into_parts();
     /// // Generates: SELECT * FROM users WHERE deleted_at IS NULL
     /// ```
     pub fn is_null(mut self, column: &str, check: bool) -> Self {
@@ -602,11 +667,11 @@ impl<'a> WhereBuilder<'a> {
     ///
     /// let query = WhereBuilder::new("SELECT * FROM users")
     ///     .raw("EXTRACT(year FROM created_at) =", Some(2024))
-    ///     .build();
+    ///     .into_parts();
     /// ```
     pub fn raw<T>(mut self, sql: &str, value: Option<T>) -> Self
     where
-        T: 'a + Send + sqlx::Type<Postgres> + sqlx::Encode<'a, Postgres>,
+        T: Send + sqlx::Type<Postgres> + for<'q> sqlx::Encode<'q, Postgres>,
     {
         if let Some(val) = value {
             self.add_condition(sql);
@@ -631,12 +696,12 @@ impl<'a> WhereBuilder<'a> {
     ///         group.eq("role", Some("admin"))
     ///              .eq("role", Some("moderator"));
     ///     })
-    ///     .build();
+    ///     .into_parts();
     /// // Generates: SELECT * FROM users WHERE status = $1 AND (role = $2 OR role = $3)
     /// ```
     pub fn or_group<F>(mut self, f: F) -> Self
     where
-        F: FnOnce(&mut OrGroup<'_, 'a>),
+        F: FnOnce(&mut OrGroup),
     {
         self.add_condition("(");
         let mut group = OrGroup::new(&mut self.builder);
@@ -650,7 +715,7 @@ impl<'a> WhereBuilder<'a> {
     /// Similar to `or_group()` but with AND logic between conditions.
     pub fn and_group<F>(mut self, f: F) -> Self
     where
-        F: FnOnce(&mut AndGroup<'_, 'a>),
+        F: FnOnce(&mut AndGroup),
     {
         self.add_condition("(");
         let mut group = AndGroup::new(&mut self.builder);
@@ -677,12 +742,12 @@ impl<'a> WhereBuilder<'a> {
     ///
     /// let query = WhereBuilder::new("SELECT * FROM users")
     ///     .json_eq("metadata", "role", Some("admin"))
-    ///     .build();
+    ///     .into_parts();
     /// // Generates: SELECT * FROM users WHERE metadata->>'role' = $1
     /// ```
     pub fn json_eq<T>(self, column: &str, path: &str, value: Option<T>) -> Self
     where
-        T: 'a + Send + sqlx::Type<Postgres> + sqlx::Encode<'a, Postgres>,
+        T: Send + sqlx::Type<Postgres> + for<'q> sqlx::Encode<'q, Postgres>,
     {
         self.and_if(&format!("{column}->>'{path}' ="), "", value)
     }
@@ -705,7 +770,7 @@ impl<'a> WhereBuilder<'a> {
     ///
     /// let query = WhereBuilder::new("SELECT * FROM users")
     ///     .json_contains("metadata", Some(json!({"active": true})))
-    ///     .build();
+    ///     .into_parts();
     /// // Generates: SELECT * FROM users WHERE metadata @> $1
     /// ```
     pub fn json_contains(mut self, column: &str, value: Option<serde_json::Value>) -> Self {
@@ -733,7 +798,7 @@ impl<'a> WhereBuilder<'a> {
     ///
     /// let query = WhereBuilder::new("SELECT * FROM articles")
     ///     .text_search("search_vector", Some("rust programming".to_string()))
-    ///     .build();
+    ///     .into_parts();
     /// // Generates: SELECT * FROM articles WHERE search_vector @@ plainto_tsquery('english', $1)
     /// ```
     pub fn text_search(mut self, column: &str, query: Option<String>) -> Self {
@@ -767,7 +832,7 @@ impl<'a> WhereBuilder<'a> {
     ///
     /// let query = WhereBuilder::new("SELECT * FROM orders")
     ///     .date_in_range("created_at", Some(start), Some(end))
-    ///     .build();
+    ///     .into_parts();
     /// ```
     pub fn date_in_range(
         self,
@@ -795,7 +860,7 @@ impl<'a> WhereBuilder<'a> {
     ///
     /// let query = WhereBuilder::new("SELECT * FROM logs")
     ///     .within_days("created_at", Some(7))
-    ///     .build();
+    ///     .into_parts();
     /// // Generates: SELECT * FROM logs WHERE created_at >= CURRENT_DATE - INTERVAL '7 days'
     /// ```
     pub fn within_days(mut self, column: &str, days: Option<i32>) -> Self {
@@ -821,7 +886,7 @@ impl<'a> WhereBuilder<'a> {
     ///
     /// let query = WhereBuilder::new("SELECT * FROM users")
     ///     .exists("SELECT 1 FROM orders WHERE orders.user_id = users.id")
-    ///     .build();
+    ///     .into_parts();
     /// // Generates: SELECT * FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id)
     /// ```
     pub fn exists(mut self, subquery: &str) -> Self {
@@ -842,7 +907,7 @@ impl<'a> WhereBuilder<'a> {
     ///
     /// let query = WhereBuilder::new("SELECT * FROM users")
     ///     .not_exists("SELECT 1 FROM orders WHERE orders.user_id = users.id")
-    ///     .build();
+    ///     .into_parts();
     /// // Generates: SELECT * FROM users WHERE NOT EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id)
     /// ```
     pub fn not_exists(mut self, subquery: &str) -> Self {
@@ -869,12 +934,12 @@ impl<'a> WhereBuilder<'a> {
     ///
     /// let query = WhereBuilder::new("SELECT * FROM users")
     ///     .not_in("status", Some(vec!["banned", "suspended"]))
-    ///     .build();
+    ///     .into_parts();
     /// // Generates: SELECT * FROM users WHERE status != ALL($1)
     /// ```
     pub fn not_in<T>(mut self, column: &str, values: Option<Vec<T>>) -> Self
     where
-        T: 'a + Send + sqlx::Type<Postgres> + sqlx::Encode<'a, Postgres> + PgHasArrayType,
+        T: Send + sqlx::Type<Postgres> + for<'q> sqlx::Encode<'q, Postgres> + PgHasArrayType,
     {
         if let Some(vals) = values {
             if !vals.is_empty() {
@@ -903,7 +968,7 @@ impl<'a> WhereBuilder<'a> {
     ///
     /// let query = WhereBuilder::new("SELECT * FROM users")
     ///     .eq_ci("email", Some("JOHN@EXAMPLE.COM".to_string()))
-    ///     .build();
+    ///     .into_parts();
     /// // Generates: SELECT * FROM users WHERE LOWER(email) = $1 (with lowercased value)
     /// ```
     pub fn eq_ci(self, column: &str, value: Option<String>) -> Self {
@@ -930,7 +995,7 @@ impl<'a> WhereBuilder<'a> {
     ///
     /// let query = WhereBuilder::new("SELECT * FROM users")
     ///     .active_only(true)
-    ///     .build();
+    ///     .into_parts();
     /// // Generates: SELECT * FROM users WHERE deleted_at IS NULL
     /// ```
     pub fn active_only(mut self, check: bool) -> Self {
@@ -960,7 +1025,7 @@ impl<'a> WhereBuilder<'a> {
     /// let query = WhereBuilder::new("SELECT * FROM users")
     ///     .eq("status", Some("active"))
     ///     .paginate(&pagination)
-    ///     .build();
+    ///     .into_parts();
     /// // Generates: SELECT * FROM users WHERE status = $1 ORDER BY created_at DESC LIMIT 10 OFFSET 10
     /// ```
     ///
@@ -971,7 +1036,7 @@ impl<'a> WhereBuilder<'a> {
     /// let pagination = Paginate::desc("name", 1, 5);
     /// let query = WhereBuilder::new("SELECT * FROM products")
     ///     .paginate(&pagination)
-    ///     .build();
+    ///     .into_parts();
     /// // Generates: SELECT * FROM products ORDER BY name DESC LIMIT 5 OFFSET 0
     /// ```
     pub fn paginate(mut self, pagination: &Paginate) -> Self {
@@ -999,7 +1064,7 @@ impl<'a> WhereBuilder<'a> {
         self.builder.sql().to_string()
     }
 
-    /// Consumes the builder and returns the underlying SQLx `QueryBuilder`.
+    /// Consumes the builder and returns the underlying SQL query and arguments.
     ///
     /// This is the final step that allows you to execute the query using SQLx methods
     /// like `fetch_all()`, `fetch_one()`, etc.
@@ -1009,15 +1074,15 @@ impl<'a> WhereBuilder<'a> {
     /// ```rust
     /// use query_builder::WhereBuilder;
     ///
-    /// let query = WhereBuilder::new("SELECT * FROM users")
+    /// let (sql, arguments) = WhereBuilder::new("SELECT * FROM users")
     ///     .eq("status", Some("active"))
-    ///     .build();
+    ///     .into_parts();
     ///
     /// // Now you can execute with SQLx:
-    /// // let users = query.fetch_all(&pool).await?;
+    /// // let users = sqlx::query_with(&sql, arguments).fetch_all(&pool).await?;
     /// ```
-    pub fn build(self) -> QueryBuilder<'a, Postgres> {
-        self.builder
+    pub fn into_parts(self) -> (String, PgArguments) {
+        self.builder.into_parts()
     }
 }
 
@@ -1055,13 +1120,13 @@ impl LikePosition {
 /// This struct is used within `or_group()` closures to build expressions like
 /// `(condition1 OR condition2 OR condition3)`. All methods are conditional
 /// and only add clauses when provided with `Some` values.
-pub struct OrGroup<'b, 'a> {
-    builder: &'b mut QueryBuilder<'a, Postgres>,
+pub struct OrGroup<'a> {
+    builder: &'a mut PgQueryBuilder,
     condition_count: usize,
 }
 
-impl<'b, 'a> OrGroup<'b, 'a> {
-    fn new(builder: &'b mut QueryBuilder<'a, Postgres>) -> Self {
+impl<'a> OrGroup<'a> {
+    fn new(builder: &'a mut PgQueryBuilder) -> Self {
         Self {
             builder,
             condition_count: 0,
@@ -1258,7 +1323,7 @@ impl<'b, 'a> OrGroup<'b, 'a> {
     // Nested AND group
     pub fn and_group<F>(&mut self, f: F) -> &mut Self
     where
-        F: FnOnce(&mut AndGroup<'_, 'a>),
+        F: FnOnce(&mut AndGroup),
     {
         self.add_condition("(");
         let mut group = AndGroup::new(self.builder);
@@ -1273,13 +1338,13 @@ impl<'b, 'a> OrGroup<'b, 'a> {
 /// This struct is used within `and_group()` closures to build expressions like
 /// `(condition1 AND condition2 AND condition3)`. All methods are conditional
 /// and only add clauses when provided with `Some` values.
-pub struct AndGroup<'b, 'a> {
-    builder: &'b mut QueryBuilder<'a, Postgres>,
+pub struct AndGroup<'a> {
+    builder: &'a mut PgQueryBuilder,
     condition_count: usize,
 }
 
-impl<'b, 'a> AndGroup<'b, 'a> {
-    fn new(builder: &'b mut QueryBuilder<'a, Postgres>) -> Self {
+impl<'a> AndGroup<'a> {
+    fn new(builder: &'a mut PgQueryBuilder) -> Self {
         Self {
             builder,
             condition_count: 0,
@@ -1328,7 +1393,7 @@ impl<'b, 'a> AndGroup<'b, 'a> {
     ///         group.eq("status", Some("active"))
     ///              .eq("role", Some("admin"));
     ///     })
-    ///     .build();
+    ///     .into_parts();
     /// // Generates: SELECT * FROM users WHERE (status = $1 AND role = $2)
     /// ```
     pub fn eq<T>(&mut self, column: &str, value: Option<T>) -> &mut Self
@@ -1531,12 +1596,12 @@ impl<'b, 'a> AndGroup<'b, 'a> {
     ///                              .eq("role", Some("moderator"));
     ///                  });
     ///     })
-    ///     .build();
+    ///     .into_parts();
     /// // Generates: SELECT * FROM users WHERE (status = $1 AND (role = $2 OR role = $3))
     /// ```
     pub fn or_group<F>(&mut self, f: F) -> &mut Self
     where
-        F: FnOnce(&mut OrGroup<'_, 'a>),
+        F: FnOnce(&mut OrGroup),
     {
         self.add_condition("(");
         let mut group = OrGroup::new(self.builder);
@@ -1553,23 +1618,21 @@ mod tests {
     #[test]
     fn test_complex_or_conditions_with_null_checks() {
         // Test the specific example: ((name = "Daniel" AND deleted_at IS NULL) OR (name = "Sven" AND deleted_at IS NULL))
-        let query = WhereBuilder::new("SELECT * FROM users")
-            .or_group(|group| {
-                group
-                    .and_group(|and_group| {
-                        and_group
-                            .eq("name", Some("Daniel"))
-                            .is_null("deleted_at", true);
-                    })
-                    .and_group(|and_group| {
-                        and_group
-                            .eq("name", Some("Sven"))
-                            .is_null("deleted_at", true);
-                    });
-            })
-            .build();
+        let query = WhereBuilder::new("SELECT * FROM users").or_group(|group| {
+            group
+                .and_group(|and_group| {
+                    and_group
+                        .eq("name", Some("Daniel"))
+                        .is_null("deleted_at", true);
+                })
+                .and_group(|and_group| {
+                    and_group
+                        .eq("name", Some("Sven"))
+                        .is_null("deleted_at", true);
+                });
+        });
 
-        let sql = query.sql();
+        let sql = query.to_sql();
         assert_eq!(
             sql,
             "SELECT * FROM users WHERE ((name =$1 AND deleted_at IS NULL) OR (name =$2 AND deleted_at IS NULL))"
@@ -1581,10 +1644,9 @@ mod tests {
         let query = WhereBuilder::new("SELECT * FROM products")
             .eq("category", Some("electronics"))
             .gt("price", Some(100))
-            .active_only(true)
-            .build();
+            .active_only(true);
 
-        let sql = query.sql();
+        let sql = query.to_sql();
         assert_eq!(
             sql,
             "SELECT * FROM products WHERE category =$1 AND price >$2 AND deleted_at IS NULL"
@@ -1601,10 +1663,9 @@ mod tests {
                     .eq("role", Some("admin"))
                     .eq("role", Some("moderator"));
             })
-            .active_only(true)
-            .build();
+            .active_only(true);
 
-        let sql = query.sql();
+        let sql = query.to_sql();
         assert_eq!(
             sql,
             "SELECT * FROM users WHERE status =$1 AND (role =$2 OR role =$3) AND deleted_at IS NULL"
@@ -1622,10 +1683,9 @@ mod tests {
                 group
                     .eq("status", Some("active"))
                     .eq("status", Some("pending"));
-            })
-            .build();
+            });
 
-        let sql = query.sql();
+        let sql = query.to_sql();
         assert_eq!(
             sql,
             "SELECT * FROM users WHERE (name =$1 OR name =$2) AND (status =$3 OR status =$4)"
@@ -1645,10 +1705,9 @@ mod tests {
                     .and_group(|and_group| {
                         and_group.eq("author", Some("Jones")).gt("year", Some(2019));
                     });
-            })
-            .build();
+            });
 
-        let sql = query.sql();
+        let sql = query.to_sql();
         assert_eq!(
             sql,
             "SELECT * FROM books WHERE category =$1 AND ((author =$2 AND year >$3) OR (author =$4 AND year >$5))"
@@ -1661,10 +1720,9 @@ mod tests {
         let query = WhereBuilder::new("SELECT * FROM users")
             .eq("name", Some("Alice"))
             .eq("age", None::<i32>)
-            .eq("status", Some("active"))
-            .build();
+            .eq("status", Some("active"));
 
-        let sql = query.sql();
+        let sql = query.to_sql();
         assert_eq!(sql, "SELECT * FROM users WHERE name =$1 AND status =$2");
     }
 
@@ -1681,10 +1739,9 @@ mod tests {
                         LikePosition::Contains,
                     );
             })
-            .active_only(true)
-            .build();
+            .active_only(true);
 
-        let sql = query.sql();
+        let sql = query.to_sql();
         assert_eq!(
             sql,
             "SELECT * FROM articles WHERE (title LIKE$1 OR content LIKE$2) AND deleted_at IS NULL"
@@ -1696,10 +1753,9 @@ mod tests {
         // Test array membership conditions
         let query = WhereBuilder::new("SELECT * FROM users")
             .in_array("role", Some(vec!["admin", "moderator", "editor"]))
-            .not_in("status", Some(vec!["banned", "suspended"]))
-            .build();
+            .not_in("status", Some(vec!["banned", "suspended"]));
 
-        let sql = query.sql();
+        let sql = query.to_sql();
         assert_eq!(
             sql,
             "SELECT * FROM users WHERE role = ANY($1) AND status != ALL($2)"
@@ -1711,10 +1767,9 @@ mod tests {
         // Test array overlap condition
         let query = WhereBuilder::new("SELECT * FROM properties")
             .array_overlap("asset_class", Some(vec!["hotel", "restaurant"]))
-            .eq("status", Some("active"))
-            .build();
+            .eq("status", Some("active"));
 
-        let sql = query.sql();
+        let sql = query.to_sql();
         assert_eq!(
             sql,
             "SELECT * FROM properties WHERE asset_class &&$1 AND status =$2"
@@ -1726,10 +1781,9 @@ mod tests {
         // Test array contains condition
         let query = WhereBuilder::new("SELECT * FROM properties")
             .array_contains_any("asset_class", Some(vec!["hotel", "restaurant"]))
-            .gt("price", Some(1000))
-            .build();
+            .gt("price", Some(1000));
 
-        let sql = query.sql();
+        let sql = query.to_sql();
         assert_eq!(
             sql,
             "SELECT * FROM properties WHERE asset_class @>$1 AND price >$2"
@@ -1741,10 +1795,9 @@ mod tests {
         // Test array contained-by condition
         let query = WhereBuilder::new("SELECT * FROM properties")
             .array_contained_by("asset_class", Some(vec!["hotel", "restaurant", "retail"]))
-            .active_only(true)
-            .build();
+            .active_only(true);
 
-        let sql = query.sql();
+        let sql = query.to_sql();
         assert_eq!(
             sql,
             "SELECT * FROM properties WHERE asset_class <@$1 AND deleted_at IS NULL"
@@ -1760,10 +1813,9 @@ mod tests {
             .array_contained_by(
                 "categories",
                 Some(vec!["commercial", "residential", "mixed"]),
-            )
-            .build();
+            );
 
-        let sql = query.sql();
+        let sql = query.to_sql();
         assert_eq!(
             sql,
             "SELECT * FROM properties WHERE tags &&$1 AND amenities @>$2 AND categories <@$3"
@@ -1776,10 +1828,9 @@ mod tests {
         let query = WhereBuilder::new("SELECT * FROM properties")
             .array_overlap("asset_class", Some(Vec::<String>::new()))
             .array_contains_any("tags", None::<Vec<String>>)
-            .eq("status", Some("active"))
-            .build();
+            .eq("status", Some("active"));
 
-        let sql = query.sql();
+        let sql = query.to_sql();
         assert_eq!(sql, "SELECT * FROM properties WHERE status =$1");
     }
 
@@ -1792,10 +1843,9 @@ mod tests {
                     .array_overlap("asset_class", Some(vec!["hotel", "restaurant"]))
                     .array_contains_any("amenities", Some(vec!["pool", "spa"]));
             })
-            .active_only(true)
-            .build();
+            .active_only(true);
 
-        let sql = query.sql();
+        let sql = query.to_sql();
         assert_eq!(
             sql,
             "SELECT * FROM properties WHERE (asset_class &&$1 OR amenities @>$2) AND deleted_at IS NULL"
@@ -1811,10 +1861,9 @@ mod tests {
                     .array_overlap("tags", Some(vec!["luxury"]))
                     .array_contained_by("categories", Some(vec!["residential", "commercial"]));
             })
-            .gt("price", Some(500000))
-            .build();
+            .gt("price", Some(500000));
 
-        let sql = query.sql();
+        let sql = query.to_sql();
         assert_eq!(
             sql,
             "SELECT * FROM properties WHERE (tags &&$1 AND categories <@$2) AND price >$3"
@@ -1829,10 +1878,9 @@ mod tests {
             .json_contains(
                 "preferences",
                 Some(serde_json::json!({"notifications": true})),
-            )
-            .build();
+            );
 
-        let sql = query.sql();
+        let sql = query.to_sql();
         assert_eq!(
             sql,
             "SELECT * FROM users WHERE metadata->>'department' = $1 AND preferences @>$2"
@@ -1845,10 +1893,9 @@ mod tests {
         let pagination = Paginate::asc("name", 1, 10);
         let query = WhereBuilder::new("SELECT * FROM users")
             .eq("status", Some("active"))
-            .paginate(&pagination)
-            .build();
+            .paginate(&pagination);
 
-        let sql = query.sql();
+        let sql = query.to_sql();
         assert_eq!(
             sql,
             "SELECT * FROM users WHERE status =$1 ORDER BY name ASC LIMIT 10 OFFSET 0"
@@ -1859,11 +1906,9 @@ mod tests {
     fn test_paginate_desc() {
         // Test pagination with DESC order
         let pagination = Paginate::desc("created_at", 2, 5);
-        let query = WhereBuilder::new("SELECT * FROM posts")
-            .paginate(&pagination)
-            .build();
+        let query = WhereBuilder::new("SELECT * FROM posts").paginate(&pagination);
 
-        let sql = query.sql();
+        let sql = query.to_sql();
         assert_eq!(
             sql,
             "SELECT * FROM posts ORDER BY created_at DESC LIMIT 5 OFFSET 5"
@@ -1877,10 +1922,9 @@ mod tests {
         let query = WhereBuilder::new("SELECT * FROM articles")
             .eq("published", Some(true))
             .gt("views", Some(1000))
-            .paginate(&pagination)
-            .build();
+            .paginate(&pagination);
 
-        let sql = query.sql();
+        let sql = query.to_sql();
         assert_eq!(
             sql,
             "SELECT * FROM articles WHERE published =$1 AND views >$2 ORDER BY updated_at DESC LIMIT 20 OFFSET 40"
@@ -1891,11 +1935,9 @@ mod tests {
     fn test_paginate_default() {
         // Test default pagination
         let pagination = Paginate::default();
-        let query = WhereBuilder::new("SELECT * FROM products")
-            .paginate(&pagination)
-            .build();
+        let query = WhereBuilder::new("SELECT * FROM products").paginate(&pagination);
 
-        let sql = query.sql();
+        let sql = query.to_sql();
         assert_eq!(
             sql,
             "SELECT * FROM products ORDER BY id ASC LIMIT 20 OFFSET 0"
@@ -1953,10 +1995,9 @@ mod tests {
                     .eq("role", Some("moderator"));
             })
             .between("age", Some(18), Some(65))
-            .paginate(&pagination)
-            .build();
+            .paginate(&pagination);
 
-        let sql = query.sql();
+        let sql = query.to_sql();
         assert_eq!(
             sql,
             "SELECT * FROM users WHERE active =$1 AND (role =$2 OR role =$3) AND age >=$4 AND age <=$5 ORDER BY score DESC LIMIT 5 OFFSET 0"

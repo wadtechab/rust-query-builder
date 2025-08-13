@@ -17,7 +17,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-query-builder = "0.1.0"
+query-builder = "0.2.0"
 sqlx = { version = "0.8", features = ["postgres", "chrono"] }
 ```
 
@@ -30,10 +30,11 @@ let query = WhereBuilder::new("SELECT * FROM users")
     .eq("status", Some("active"))
     .gt("age", Some(18))
     .like("name", Some("John".to_string()), LikePosition::Start)
-    .build();
+    .into_parts();
 
 // Execute with SQLx
-let users = query.fetch_all(&pool).await?;
+let (sql, args) = query;
+let users = sqlx::query_with(&sql, args).fetch_all(&pool).await?;
 ```
 
 ## Complex Conditions with Groups
@@ -41,19 +42,22 @@ let users = query.fetch_all(&pool).await?;
 ```rust
 use query_builder::{WhereBuilder, LikePosition};
 
-let query = WhereBuilder::new("SELECT * FROM products")
+let (sql, args) = WhereBuilder::new("SELECT * FROM products")
     .eq("category", Some("electronics"))
     .or_group(|group| {
         group.gt("price", Some(100))
              .eq("brand", Some("Apple"));
     })
     .active_only(true)
-    .build();
+    .into_parts();
 
-// Generates: SELECT * FROM products 
-//           WHERE category = $1 
-//           AND (price > $2 OR brand = $3) 
-//           AND deleted_at IS NULL
+// Execute with SQLx
+let products = sqlx::query_with(&sql, args).fetch_all(&pool).await?;
+
+// Generated SQL: SELECT * FROM products 
+//               WHERE category = $1 
+//               AND (price > $2 OR brand = $3) 
+//               AND deleted_at IS NULL
 ```
 
 ## Pagination Support
@@ -62,15 +66,18 @@ let query = WhereBuilder::new("SELECT * FROM products")
 use query_builder::{WhereBuilder, Paginate, SortDirection};
 
 let pagination = Paginate::desc("created_at", 2, 10);
-let query = WhereBuilder::new("SELECT * FROM articles")
+let (sql, args) = WhereBuilder::new("SELECT * FROM articles")
     .eq("published", Some(true))
     .like("title", Some("rust".to_string()), LikePosition::Contains)
     .paginate(&pagination)
-    .build();
+    .into_parts();
 
-// Generates: SELECT * FROM articles 
-//           WHERE published = $1 AND title LIKE $2
-//           ORDER BY created_at DESC LIMIT 10 OFFSET 10
+// Execute with SQLx
+let articles = sqlx::query_with(&sql, args).fetch_all(&pool).await?;
+
+// Generated SQL: SELECT * FROM articles 
+//               WHERE published = $1 AND title LIKE $2
+//               ORDER BY created_at DESC LIMIT 10 OFFSET 10
 ```
 
 ## Available Operations
@@ -140,9 +147,10 @@ async fn get_users(
         .like("name", search, LikePosition::Contains)
         .active_only(true)
         .paginate(&pagination)
-        .build();
+        .into_parts();
 
-    query.fetch_all(&pool).await
+    let (sql, args) = query;
+    sqlx::query_with(&sql, args).fetch_all(&pool).await
 }
 ```
 
@@ -171,7 +179,7 @@ use query_builder::LikePosition;
 ### Complex Nested Groups
 
 ```rust
-let query = WhereBuilder::new("SELECT * FROM orders")
+let (sql, args) = WhereBuilder::new("SELECT * FROM orders")
     .eq("status", Some("pending"))
     .or_group(|group| {
         group.and_group(|and_group| {
@@ -183,7 +191,10 @@ let query = WhereBuilder::new("SELECT * FROM orders")
                          .gt("amount", Some(1000.0));
             });
     })
-    .build();
+    .into_parts();
+
+// Execute with SQLx
+let orders = sqlx::query_with(&sql, args).fetch_all(&pool).await?;
 ```
 
 ### JSON Queries
@@ -191,41 +202,50 @@ let query = WhereBuilder::new("SELECT * FROM orders")
 ```rust
 use serde_json::json;
 
-let query = WhereBuilder::new("SELECT * FROM users")
+let (sql, args) = WhereBuilder::new("SELECT * FROM users")
     .json_eq("metadata", "department", Some("engineering"))
     .json_contains("preferences", Some(json!({"notifications": true})))
-    .build();
+    .into_parts();
+
+// Execute with SQLx
+let users = sqlx::query_with(&sql, args).fetch_all(&pool).await?;
 ```
 
 ### PostgreSQL Array Operations
 
 ```rust
 // Array overlap - checks if arrays have any common elements
-let query = WhereBuilder::new("SELECT * FROM properties")
+let (sql, args) = WhereBuilder::new("SELECT * FROM properties")
     .array_overlap("asset_class", Some(vec!["hotel", "restaurant"]))
-    .build();
-// Generates: SELECT * FROM properties WHERE asset_class && $1
+    .into_parts();
+// Generated SQL: SELECT * FROM properties WHERE asset_class && $1
 
 // Array contains - checks if array contains all specified elements
-let query = WhereBuilder::new("SELECT * FROM properties")
+let (sql, args) = WhereBuilder::new("SELECT * FROM properties")
     .array_contains_any("amenities", Some(vec!["pool", "gym"]))
-    .build();
-// Generates: SELECT * FROM properties WHERE amenities @> $1
+    .into_parts();
+// Generated SQL: SELECT * FROM properties WHERE amenities @> $1
 
 // Array contained by - checks if array is subset of specified elements
-let query = WhereBuilder::new("SELECT * FROM properties")
+let (sql, args) = WhereBuilder::new("SELECT * FROM properties")
     .array_contained_by("categories", Some(vec!["commercial", "residential", "mixed"]))
-    .build();
-// Generates: SELECT * FROM properties WHERE categories <@ $1
+    .into_parts();
+// Generated SQL: SELECT * FROM properties WHERE categories <@ $1
+
+// Execute any of these with SQLx
+let properties = sqlx::query_with(&sql, args).fetch_all(&pool).await?;
 ```
 
 ### Full-text Search
 
 ```rust
-let query = WhereBuilder::new("SELECT * FROM articles")
+let (sql, args) = WhereBuilder::new("SELECT * FROM articles")
     .text_search("search_vector", Some("rust programming".to_string()))
     .eq("published", Some(true))
-    .build();
+    .into_parts();
+
+// Execute with SQLx
+let articles = sqlx::query_with(&sql, args).fetch_all(&pool).await?;
 ```
 
 ## License
