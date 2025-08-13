@@ -452,6 +452,105 @@ impl<'a> WhereBuilder<'a> {
         self
     }
 
+    /// Adds an array overlap condition using PostgreSQL's `&&` operator.
+    ///
+    /// Checks if the array column has any elements in common with the provided array.
+    /// This is useful for checking if arrays intersect or have overlapping values.
+    ///
+    /// # Arguments
+    ///
+    /// * `column` - The array column name
+    /// * `values` - Array of values to check for overlap
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use query_builder::WhereBuilder;
+    ///
+    /// let query = WhereBuilder::new("SELECT * FROM properties")
+    ///     .array_overlap("asset_class", Some(vec!["hotel", "restaurant"]))
+    ///     .build();
+    /// // Generates: SELECT * FROM properties WHERE asset_class && $1
+    /// ```
+    pub fn array_overlap<T>(mut self, column: &str, values: Option<Vec<T>>) -> Self
+    where
+        T: 'a + Send + sqlx::Type<Postgres> + sqlx::Encode<'a, Postgres> + PgHasArrayType,
+    {
+        if let Some(vals) = values {
+            if !vals.is_empty() {
+                self.add_condition(&format!("{column} &&"));
+                self.builder.push_bind(vals);
+            }
+        }
+        self
+    }
+
+    /// Adds an array contains condition using PostgreSQL's `@>` operator.
+    ///
+    /// Checks if the array column contains all elements from the provided array.
+    /// This is useful for checking if an array field contains specific values.
+    ///
+    /// # Arguments
+    ///
+    /// * `column` - The array column name
+    /// * `values` - Array of values that should all be contained in the column
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use query_builder::WhereBuilder;
+    ///
+    /// let query = WhereBuilder::new("SELECT * FROM properties")
+    ///     .array_contains_any("asset_class", Some(vec!["hotel", "restaurant"]))
+    ///     .build();
+    /// // Generates: SELECT * FROM properties WHERE asset_class @> $1
+    /// ```
+    pub fn array_contains_any<T>(mut self, column: &str, values: Option<Vec<T>>) -> Self
+    where
+        T: 'a + Send + sqlx::Type<Postgres> + sqlx::Encode<'a, Postgres> + PgHasArrayType,
+    {
+        if let Some(vals) = values {
+            if !vals.is_empty() {
+                self.add_condition(&format!("{column} @>"));
+                self.builder.push_bind(vals);
+            }
+        }
+        self
+    }
+
+    /// Adds an array contained-by condition using PostgreSQL's `<@` operator.
+    ///
+    /// Checks if the array column is contained by (is a subset of) the provided array.
+    /// This is useful for checking if all values in an array field are within a specific set.
+    ///
+    /// # Arguments
+    ///
+    /// * `column` - The array column name
+    /// * `values` - Array of values that should contain all elements from the column
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use query_builder::WhereBuilder;
+    ///
+    /// let query = WhereBuilder::new("SELECT * FROM properties")
+    ///     .array_contained_by("asset_class", Some(vec!["hotel", "restaurant", "retail"]))
+    ///     .build();
+    /// // Generates: SELECT * FROM properties WHERE asset_class <@ $1
+    /// ```
+    pub fn array_contained_by<T>(mut self, column: &str, values: Option<Vec<T>>) -> Self
+    where
+        T: 'a + Send + sqlx::Type<Postgres> + sqlx::Encode<'a, Postgres> + PgHasArrayType,
+    {
+        if let Some(vals) = values {
+            if !vals.is_empty() {
+                self.add_condition(&format!("{column} <@"));
+                self.builder.push_bind(vals);
+            }
+        }
+        self
+    }
+
     /// Adds a case-insensitive LIKE condition (ILIKE) with configurable wildcard positioning.
     ///
     /// Similar to `like()` but performs case-insensitive matching.
@@ -1081,6 +1180,45 @@ impl<'b, 'a> OrGroup<'b, 'a> {
         self
     }
 
+    pub fn array_overlap<T>(&mut self, column: &str, values: Option<Vec<T>>) -> &mut Self
+    where
+        T: 'a + Send + sqlx::Type<Postgres> + sqlx::Encode<'a, Postgres> + PgHasArrayType,
+    {
+        if let Some(vals) = values {
+            if !vals.is_empty() {
+                self.add_condition(&format!("{column} &&"));
+                self.builder.push_bind(vals);
+            }
+        }
+        self
+    }
+
+    pub fn array_contains_any<T>(&mut self, column: &str, values: Option<Vec<T>>) -> &mut Self
+    where
+        T: 'a + Send + sqlx::Type<Postgres> + sqlx::Encode<'a, Postgres> + PgHasArrayType,
+    {
+        if let Some(vals) = values {
+            if !vals.is_empty() {
+                self.add_condition(&format!("{column} @>"));
+                self.builder.push_bind(vals);
+            }
+        }
+        self
+    }
+
+    pub fn array_contained_by<T>(&mut self, column: &str, values: Option<Vec<T>>) -> &mut Self
+    where
+        T: 'a + Send + sqlx::Type<Postgres> + sqlx::Encode<'a, Postgres> + PgHasArrayType,
+    {
+        if let Some(vals) = values {
+            if !vals.is_empty() {
+                self.add_condition(&format!("{column} <@"));
+                self.builder.push_bind(vals);
+            }
+        }
+        self
+    }
+
     // NULL handling
     pub fn is_null(&mut self, column: &str, check: bool) -> &mut Self {
         if check {
@@ -1276,6 +1414,54 @@ impl<'b, 'a> AndGroup<'b, 'a> {
                 self.add_condition(&format!("{column} = ANY("));
                 self.builder.push_bind(vals);
                 self.builder.push(")");
+            }
+        }
+        self
+    }
+
+    /// Adds an AND array overlap condition using PostgreSQL's `&&` operator.
+    ///
+    /// Similar to the main `WhereBuilder::array_overlap()` method but within an AND group.
+    pub fn array_overlap<T>(&mut self, column: &str, values: Option<Vec<T>>) -> &mut Self
+    where
+        T: 'a + Send + sqlx::Type<Postgres> + sqlx::Encode<'a, Postgres> + PgHasArrayType,
+    {
+        if let Some(vals) = values {
+            if !vals.is_empty() {
+                self.add_condition(&format!("{column} &&"));
+                self.builder.push_bind(vals);
+            }
+        }
+        self
+    }
+
+    /// Adds an AND array contains condition using PostgreSQL's `@>` operator.
+    ///
+    /// Similar to the main `WhereBuilder::array_contains_any()` method but within an AND group.
+    pub fn array_contains_any<T>(&mut self, column: &str, values: Option<Vec<T>>) -> &mut Self
+    where
+        T: 'a + Send + sqlx::Type<Postgres> + sqlx::Encode<'a, Postgres> + PgHasArrayType,
+    {
+        if let Some(vals) = values {
+            if !vals.is_empty() {
+                self.add_condition(&format!("{column} @>"));
+                self.builder.push_bind(vals);
+            }
+        }
+        self
+    }
+
+    /// Adds an AND array contained-by condition using PostgreSQL's `<@` operator.
+    ///
+    /// Similar to the main `WhereBuilder::array_contained_by()` method but within an AND group.
+    pub fn array_contained_by<T>(&mut self, column: &str, values: Option<Vec<T>>) -> &mut Self
+    where
+        T: 'a + Send + sqlx::Type<Postgres> + sqlx::Encode<'a, Postgres> + PgHasArrayType,
+    {
+        if let Some(vals) = values {
+            if !vals.is_empty() {
+                self.add_condition(&format!("{column} <@"));
+                self.builder.push_bind(vals);
             }
         }
         self
@@ -1517,6 +1703,121 @@ mod tests {
         assert_eq!(
             sql,
             "SELECT * FROM users WHERE role = ANY($1) AND status != ALL($2)"
+        );
+    }
+
+    #[test]
+    fn test_array_overlap_operations() {
+        // Test array overlap condition
+        let query = WhereBuilder::new("SELECT * FROM properties")
+            .array_overlap("asset_class", Some(vec!["hotel", "restaurant"]))
+            .eq("status", Some("active"))
+            .build();
+
+        let sql = query.sql();
+        assert_eq!(
+            sql,
+            "SELECT * FROM properties WHERE asset_class &&$1 AND status =$2"
+        );
+    }
+
+    #[test]
+    fn test_array_contains_any_operations() {
+        // Test array contains condition
+        let query = WhereBuilder::new("SELECT * FROM properties")
+            .array_contains_any("asset_class", Some(vec!["hotel", "restaurant"]))
+            .gt("price", Some(1000))
+            .build();
+
+        let sql = query.sql();
+        assert_eq!(
+            sql,
+            "SELECT * FROM properties WHERE asset_class @>$1 AND price >$2"
+        );
+    }
+
+    #[test]
+    fn test_array_contained_by_operations() {
+        // Test array contained-by condition
+        let query = WhereBuilder::new("SELECT * FROM properties")
+            .array_contained_by("asset_class", Some(vec!["hotel", "restaurant", "retail"]))
+            .active_only(true)
+            .build();
+
+        let sql = query.sql();
+        assert_eq!(
+            sql,
+            "SELECT * FROM properties WHERE asset_class <@$1 AND deleted_at IS NULL"
+        );
+    }
+
+    #[test]
+    fn test_combined_array_operations() {
+        // Test multiple array operations together
+        let query = WhereBuilder::new("SELECT * FROM properties")
+            .array_overlap("tags", Some(vec!["luxury", "downtown"]))
+            .array_contains_any("amenities", Some(vec!["pool", "gym"]))
+            .array_contained_by(
+                "categories",
+                Some(vec!["commercial", "residential", "mixed"]),
+            )
+            .build();
+
+        let sql = query.sql();
+        assert_eq!(
+            sql,
+            "SELECT * FROM properties WHERE tags &&$1 AND amenities @>$2 AND categories <@$3"
+        );
+    }
+
+    #[test]
+    fn test_array_operations_with_empty_arrays() {
+        // Test that empty arrays don't add conditions
+        let query = WhereBuilder::new("SELECT * FROM properties")
+            .array_overlap("asset_class", Some(Vec::<String>::new()))
+            .array_contains_any("tags", None::<Vec<String>>)
+            .eq("status", Some("active"))
+            .build();
+
+        let sql = query.sql();
+        assert_eq!(sql, "SELECT * FROM properties WHERE status =$1");
+    }
+
+    #[test]
+    fn test_array_operations_in_or_groups() {
+        // Test array operations within OR groups
+        let query = WhereBuilder::new("SELECT * FROM properties")
+            .or_group(|group| {
+                group
+                    .array_overlap("asset_class", Some(vec!["hotel", "restaurant"]))
+                    .array_contains_any("amenities", Some(vec!["pool", "spa"]));
+            })
+            .active_only(true)
+            .build();
+
+        let sql = query.sql();
+        assert_eq!(
+            sql,
+            "SELECT * FROM properties WHERE (asset_class &&$1 OR amenities @>$2) AND deleted_at IS NULL"
+        );
+    }
+
+    #[test]
+    fn test_array_operations_in_and_groups() {
+        // Test array operations within AND groups
+        let query = WhereBuilder::new("SELECT * FROM properties")
+            .and_group(|group| {
+                group
+                    .array_overlap("tags", Some(vec!["luxury"]))
+                    .array_contained_by("categories", Some(vec!["residential", "commercial"]));
+            })
+            .gt("price", Some(500000))
+            .build();
+
+        let sql = query.sql();
+        assert_eq!(
+            sql,
+            "SELECT * FROM properties WHERE (tags &&$1 AND categories <@$2) AND price >$3"
         );
     }
 

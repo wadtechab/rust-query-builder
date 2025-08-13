@@ -92,6 +92,9 @@ let query = WhereBuilder::new("SELECT * FROM articles")
 ### Array Operations
 - `in_array(column, values)` - Membership (`= ANY()`)
 - `not_in(column, values)` - Exclusion (`!= ALL()`)
+- `array_overlap(column, values)` - Array overlap (`&&`)
+- `array_contains_any(column, values)` - Array contains (`@>`)
+- `array_contained_by(column, values)` - Array contained by (`<@`)
 
 ### JSON Operations
 - `json_eq(column, path, value)` - JSON field equality
@@ -192,6 +195,28 @@ let query = WhereBuilder::new("SELECT * FROM users")
     .json_eq("metadata", "department", Some("engineering"))
     .json_contains("preferences", Some(json!({"notifications": true})))
     .build();
+```
+
+### PostgreSQL Array Operations
+
+```rust
+// Array overlap - checks if arrays have any common elements
+let query = WhereBuilder::new("SELECT * FROM properties")
+    .array_overlap("asset_class", Some(vec!["hotel", "restaurant"]))
+    .build();
+// Generates: SELECT * FROM properties WHERE asset_class && $1
+
+// Array contains - checks if array contains all specified elements
+let query = WhereBuilder::new("SELECT * FROM properties")
+    .array_contains_any("amenities", Some(vec!["pool", "gym"]))
+    .build();
+// Generates: SELECT * FROM properties WHERE amenities @> $1
+
+// Array contained by - checks if array is subset of specified elements
+let query = WhereBuilder::new("SELECT * FROM properties")
+    .array_contained_by("categories", Some(vec!["commercial", "residential", "mixed"]))
+    .build();
+// Generates: SELECT * FROM properties WHERE categories <@ $1
 ```
 
 ### Full-text Search
